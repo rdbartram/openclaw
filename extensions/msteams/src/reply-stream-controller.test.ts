@@ -495,6 +495,33 @@ describe("createTeamsReplyStreamController", () => {
       conversationType: "personal",
       context: makeContext(stream),
       feedbackLoopEnabled: false,
+      msteamsConfig: { streaming: { mode: "progress" } } as never,
+      tableMode: "off",
+    });
+
+    expect(ctrl.preparePayload({ text })).toBeUndefined();
+    await expect(ctrl.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      messageId: "stream-final",
+      content: expected,
+      logicalContent: text,
+    });
+    expect(stream.clearText).not.toHaveBeenCalled();
+    expect(stream.emit).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "message", text: expected }),
+    );
+    expect(stream.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps streamed partial Markdown when rendering would rewrite it", async () => {
+    const { source: text, expected } = teamsQuotedTableReply;
+    expect(expected.startsWith(text)).toBe(false);
+    const stream = makeStream();
+    const ctrl = createTeamsReplyStreamController({
+      allowProviderPreview: true,
+      conversationType: "personal",
+      context: makeContext(stream),
+      feedbackLoopEnabled: false,
       tableMode: "off",
     });
 
@@ -503,12 +530,12 @@ describe("createTeamsReplyStreamController", () => {
     await expect(ctrl.finalize()).resolves.toEqual({
       visibleReplySent: true,
       messageId: "stream-final",
-      content: expected,
-      logicalContent: text,
+      content: text,
     });
-    expect(stream.clearText).toHaveBeenCalledTimes(1);
+    // Teams rejects a final that does not extend the streamed text.
+    expect(stream.clearText).not.toHaveBeenCalled();
     expect(stream.emit).toHaveBeenLastCalledWith(
-      expect.objectContaining({ type: "message", text: expected }),
+      expect.objectContaining({ type: "message", text: undefined }),
     );
     expect(stream.close).toHaveBeenCalledTimes(1);
   });

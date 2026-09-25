@@ -517,23 +517,50 @@ export function createTeamsReplyStreamController(params: {
           ? deferredReplacementLogicalContent()
           : undefined;
         const logicalText = pendingFinalPayload?.text ?? (emittedText || undefined);
-        const finalActivity = queuedFinalActivity ?? finalStreamActivity(logicalText);
-        const content = finalActivity.text;
-        logicalContent ??= content !== logicalText ? logicalText : undefined;
+        let finalActivity = queuedFinalActivity ?? finalStreamActivity(logicalText);
         // The replacement path already queued text and final metadata as one
         // activity. Other paths add metadata here so the SDK can merge it into
         // the closing activity without duplicating the replacement chunk.
         if (!queuedFinalActivity) {
-          if (content !== undefined && content !== emittedText) {
-            // The SDK appends text. Replace its buffer once the complete Markdown
-            // is known; retain logical text separately for acknowledged fallback.
-            stream.clearText();
-            replacementTextAwaitingAcknowledgement = { text: content, logicalText: logicalText! };
-            stream.emit(finalActivity);
+          // Teams rejects a streaming update or closing message that does not
+          // extend the text it already streamed, and emitted chunks may still
+          // be in flight, so clearText() cannot take them back. Close with the
+          // rendered final only when it extends the streamed text; otherwise
+          // keep the raw Markdown the user already watched stream. Rendered
+          // mentions are left out with it, since their <at> text is absent.
+          if (
+            finalActivity.text !== undefined &&
+            !finalActivity.text.startsWith(emittedText) &&
+            logicalText?.startsWith(emittedText)
+          ) {
+            finalActivity = { ...finalStreamActivity(), text: logicalText };
+          }
+          const finalText = finalActivity.text;
+          if (finalText !== undefined && finalText !== emittedText) {
+            if (finalText.startsWith(emittedText)) {
+              // The SDK appends text, so emit only the extension.
+              replacementTextAwaitingAcknowledgement = {
+                text: finalText,
+                logicalText: logicalText!,
+              };
+              stream.emit({ ...finalActivity, text: finalText.slice(emittedText.length) });
+            } else {
+              // The final diverges from streamed text outright. Replace the
+              // SDK buffer; if Teams rejects it, fallback delivery settles only
+              // the text Teams did not acknowledge.
+              stream.clearText();
+              replacementTextAwaitingAcknowledgement = {
+                text: finalText,
+                logicalText: logicalText!,
+              };
+              stream.emit(finalActivity);
+            }
           } else {
             stream.emit({ ...finalActivity, text: undefined });
           }
         }
+        const content = finalActivity.text;
+        logicalContent ??= content !== logicalText ? logicalText : undefined;
         const result = await stream.close();
         streamFinalizationPending = false;
         if (!result) {

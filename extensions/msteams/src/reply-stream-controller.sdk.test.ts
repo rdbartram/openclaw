@@ -38,7 +38,7 @@ const provider = createServer((request, response) => {
     const carriesStreamedText =
       activity.type === "message" || activity.channelData?.streamType === "streaming";
     const prefixViolation =
-      scenario.startsWith("prefix-") &&
+      (scenario.startsWith("prefix-") || scenario.startsWith("presentation-")) &&
       carriesStreamedText &&
       !(activity.text ?? "").startsWith(streamedText);
     const rejected =
@@ -450,7 +450,8 @@ describe("Teams native final text preparation", () => {
     controller.preparePayload({ text });
     await expect(controller.finalize()).resolves.toMatchObject({ visibleReplySent: true });
     const final = requests.findLast((request) => request.scenario === "presentation-timeout");
-    expect(final?.text).toBe("**Status**");
+    // Teams already streamed the raw heading, so the final must extend it.
+    expect(final?.text).toBe(text);
     expect(final?.entities).toEqual(
       expect.arrayContaining([
         {
@@ -469,22 +470,18 @@ describe("Teams native final text preparation", () => {
     ).toEqual([201, 201, 403, 201]);
   });
 
-  it.each(["partial", "progress"] as const)("renders the final %s activity", async (mode) => {
-    const scenario = `presentation-${mode}`;
+  it("renders the final progress activity", async () => {
+    const scenario = "presentation-progress";
     const text = "# Deployment status\n\n@[Alex](11111111-2222-3333-4444-555555555555)";
-    const { controller, firstAcknowledgement } = createLoopbackController(scenario, {
-      streaming: { mode },
+    const { controller } = createLoopbackController(scenario, {
+      streaming: { mode: "progress" },
     });
-    if (mode === "partial") {
-      controller.onPartialReply({ text });
-      await firstAcknowledgement;
-    }
     expect(controller.preparePayload({ text })).toBeUndefined();
     const result = await controller.finalize();
     expect(result.visibleReplySent).toBe(true);
-    const final = requests.findLast(
-      (request) => request.scenario === scenario && request.type === "message",
-    );
+    const scenarioRequests = requests.filter((request) => request.scenario === scenario);
+    expect(scenarioRequests.map((request) => request.status)).not.toContain(403);
+    const final = scenarioRequests.findLast((request) => request.type === "message");
     expect.soft(final?.text).toBe("**Deployment status**\n\n<at>Alex</at>");
     expect.soft(final?.entities).toEqual(
       expect.arrayContaining([
@@ -504,6 +501,57 @@ describe("Teams native final text preparation", () => {
     );
   });
 
+  it("closes a partial stream with the streamed Markdown when rendering would rewrite it", async () => {
+    const scenario = "presentation-partial";
+    const heading = "# Tools found\n\n";
+    const text = `${heading}| Tool | Scope |\n|---|---|\n| whoami | Graph |\n\n@[Alex](11111111-2222-3333-4444-555555555555)`;
+    const { acknowledgements, controller, firstAcknowledgement, logger } =
+      createLoopbackController(scenario);
+    controller.onPartialReply({ text: heading });
+    await firstAcknowledgement;
+    controller.onPartialReply({ text });
+    await expect.poll(() => acknowledgements.at(-1)?.text).toBe(text);
+    expect(controller.preparePayload({ text })).toBeUndefined();
+    await expect(controller.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      content: text,
+      messageId: `stream-${scenario}`,
+    });
+    const scenarioRequests = requests.filter((request) => request.scenario === scenario);
+    expect(scenarioRequests.map((request) => request.status)).not.toContain(403);
+    expect(logger.error).not.toHaveBeenCalled();
+    const final = scenarioRequests.at(-1);
+    expect(final).toMatchObject({ type: "message", text, status: 201 });
+    // The unrendered mention has no <at> text, so no mention entity may claim it.
+    expect(final?.entities).toEqual([
+      expect.objectContaining({ additionalType: ["AIGeneratedContent"] }),
+      expect.objectContaining({ type: "streaminfo" }),
+    ]);
+  });
+
+  it("closes a partial stream with a rendered final that extends the streamed text", async () => {
+    const scenario = "presentation-partial-extension";
+    const streamed = "Deployment finished.";
+    const text = `${streamed}\n\n# Next steps`;
+    const { controller, firstAcknowledgement } = createLoopbackController(scenario);
+    controller.onPartialReply({ text: streamed });
+    await firstAcknowledgement;
+    expect(controller.preparePayload({ text })).toBeUndefined();
+    await expect(controller.finalize()).resolves.toEqual({
+      visibleReplySent: true,
+      content: `${streamed}\n\n**Next steps**`,
+      logicalContent: text,
+      messageId: `stream-${scenario}`,
+    });
+    const scenarioRequests = requests.filter((request) => request.scenario === scenario);
+    expect(scenarioRequests.map((request) => request.status)).not.toContain(403);
+    expect(scenarioRequests.at(-1)).toMatchObject({
+      type: "message",
+      text: `${streamed}\n\n**Next steps**`,
+      status: 201,
+    });
+  });
+
   it("does not redeliver logical text already acknowledged after final rendering", async () => {
     const text = "# Deployment status\n\n@[Alex](11111111-2222-3333-4444-555555555555)";
     const { controller, firstAcknowledgement } = createLoopbackController(
@@ -512,10 +560,11 @@ describe("Teams native final text preparation", () => {
     controller.onPartialReply({ text });
     await firstAcknowledgement;
     controller.preparePayload({ text });
+    // Teams acknowledged the raw Markdown, so close resends it unrendered. The
+    // rejected close must not redeliver any of that acknowledged text.
     await expect(controller.finalize()).resolves.toEqual({
       visibleReplySent: true,
-      content: "**Deployment status**\n\n<at>Alex</at>",
-      logicalContent: text,
+      content: text,
       messageId: "stream-presentation-close-failure",
     });
     expect(
