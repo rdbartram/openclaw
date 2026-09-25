@@ -670,7 +670,9 @@ describe("createTeamsReplyStreamController", () => {
     });
 
     expect(ctrl.preparePayload({ text: "complete final answer" })).toBeUndefined();
-    expect(stream.emit).toHaveBeenCalledWith("complete final answer");
+    expect(stream.emit).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "message", text: "complete final answer" }),
+    );
   });
 
   it("ignores progress after final answer streaming starts and settles", async () => {
